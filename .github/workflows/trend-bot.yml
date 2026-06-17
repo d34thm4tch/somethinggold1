@@ -1,0 +1,39 @@
+name: Gold Trend-Following Bot
+
+on:
+  schedule:
+    - cron: '0 * * * *'    # once per hour, matches the EMA crossover's hourly candles
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run trend-following bot (single check-and-act cycle)
+        env:
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+        run: python trend_following_bot.py
+
+      - name: Commit updated logs (if changed)
+        run: |
+          git config user.name "trend-bot"
+          git config user.email "trend-bot@users.noreply.github.com"
+          git add trend_trades_log.csv trend_bot_heartbeat.csv 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update trend bot logs [skip ci]"
+          git push
