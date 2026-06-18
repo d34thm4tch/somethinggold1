@@ -50,11 +50,13 @@ SLOW_EMA_PERIOD = 21
 
 POSITION_SIZE = 0.1
 
-# Wider than the mean-reversion bot's stops, since trend trades are meant
-# to ride bigger moves. Still placeholders - check gold's recent hourly
-# ATR before trusting these.
-STOP_LOSS_POINTS = 15.0
-TAKE_PROFIT_POINTS = 30.0
+# Stop loss / take profit sized off ATR rather than fixed dollar amounts,
+# so they scale to actual gold volatility instead of being clipped by
+# normal noise. Trend trades get a wider take-profit multiplier since
+# the goal is to ride a sustained move, not take a quick profit.
+ATR_PERIOD = 14
+STOP_LOSS_ATR_MULTIPLIER = 2.0
+TAKE_PROFIT_ATR_MULTIPLIER = 4.0
 
 LOG_FILE = "trend_trades_log.csv"
 HEARTBEAT_FILE = "trend_bot_heartbeat.csv"
@@ -116,7 +118,7 @@ def find_gold_epic():
 # PRICE DATA + EMA
 # ---------------------------------------------------------------------------
 
-def get_recent_closes(num_bars=150):
+def get_recent_bars(num_bars=150):
     resp = requests.get(
         f"{BASE_URL}/prices/{GOLD_EPIC}",
         headers=session.headers(),
@@ -124,7 +126,24 @@ def get_recent_closes(num_bars=150):
     )
     resp.raise_for_status()
     data = resp.json().get("prices", [])
-    return [(p["closePrice"]["bid"] + p["closePrice"]["ask"]) / 2 for p in data]
+    highs = [(p["highPrice"]["bid"] + p["highPrice"]["ask"]) / 2 for p in data]
+    lows = [(p["lowPrice"]["bid"] + p["lowPrice"]["ask"]) / 2 for p in data]
+    closes = [(p["closePrice"]["bid"] + p["closePrice"]["ask"]) / 2 for p in data]
+    return highs, lows, closes
+
+
+def calculate_atr(highs, lows, closes, period=ATR_PERIOD):
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    return sum(trs[-period:]) / period
 
 
 def calculate_ema_series(closes, period):
@@ -149,13 +168,15 @@ def get_open_position():
     return None
 
 
-def open_position(direction, current_price):
+def open_position(direction, current_price, atr):
+    stop_distance = atr * STOP_LOSS_ATR_MULTIPLIER
+    profit_distance = atr * TAKE_PROFIT_ATR_MULTIPLIER
     if direction == "BUY":
-        stop_level = current_price - STOP_LOSS_POINTS
-        profit_level = current_price + TAKE_PROFIT_POINTS
+        stop_level = current_price - stop_distance
+        profit_level = current_price + profit_distance
     else:
-        stop_level = current_price + STOP_LOSS_POINTS
-        profit_level = current_price - TAKE_PROFIT_POINTS
+        stop_level = current_price + stop_distance
+        profit_level = current_price - profit_distance
 
     payload = {
         "epic": GOLD_EPIC,
@@ -167,7 +188,8 @@ def open_position(direction, current_price):
     resp = requests.post(f"{BASE_URL}/positions", headers=session.headers(), json=payload)
     resp.raise_for_status()
     deal_ref = resp.json().get("dealReference")
-    print(f"[{datetime.now()}] Opened {direction} at ~{current_price:.2f} (ref {deal_ref})")
+    print(f"[{datetime.now()}] Opened {direction} at ~{current_price:.2f} "
+          f"(stop={round(stop_level,2)}, profit={round(profit_level,2)}, ATR={round(atr,2)}) (ref {deal_ref})")
     log_trade(direction, current_price, "OPEN")
     return deal_ref
 
@@ -213,9 +235,10 @@ def write_heartbeat(price, fast_ema, slow_ema, position):
 def run_once():
     session.authenticate()
     try:
-        closes = get_recent_closes()
+        highs, lows, closes = get_recent_bars()
         fast = calculate_ema_series(closes, FAST_EMA_PERIOD)
         slow = calculate_ema_series(closes, SLOW_EMA_PERIOD)
+        atr = calculate_atr(highs, lows, closes)
 
         if fast is None or slow is None or len(fast) < 2:
             print(f"[{datetime.now()}] Not enough data yet for EMA calculation.")
@@ -227,25 +250,27 @@ def run_once():
         position = get_open_position()
 
         print(f"[{datetime.now()}] Price={current_price:.2f}  "
-              f"FastEMA={curr_fast:.2f}  SlowEMA={curr_slow:.2f}")
+              f"FastEMA={curr_fast:.2f}  SlowEMA={curr_slow:.2f}  ATR={atr}")
         write_heartbeat(current_price, curr_fast, curr_slow, position)
 
         crossed_up = prev_fast <= prev_slow and curr_fast > curr_slow
         crossed_down = prev_fast >= prev_slow and curr_fast < curr_slow
 
-        if crossed_up:
+        if atr is None:
+            print(f"[{datetime.now()}] ATR not available yet, skipping any new entries this run.")
+        elif crossed_up:
             if position and position["position"]["direction"] == "SELL":
                 close_position(position)
                 position = None
             if position is None:
-                open_position("BUY", current_price)
+                open_position("BUY", current_price, atr)
 
         elif crossed_down:
             if position and position["position"]["direction"] == "BUY":
                 close_position(position)
                 position = None
             if position is None:
-                open_position("SELL", current_price)
+                open_position("SELL", current_price, atr)
 
     except requests.HTTPError as e:
         print(f"[{datetime.now()}] API error: {e}")
