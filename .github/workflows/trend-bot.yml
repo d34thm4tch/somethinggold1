@@ -2,7 +2,7 @@ name: Gold Trend-Following Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'    # once per hour, matches the EMA crossover's hourly candles
+    - cron: '4,19,34,49 * * * *'   # every 15 min, offset off :00/:15/:30/:45 for reliability; checks more often than the hourly candle updates, purely as redundancy against missed/delayed runs
   workflow_dispatch:
 
 permissions:
